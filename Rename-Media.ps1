@@ -1,72 +1,66 @@
 ﻿#Requires -Version 5.1
 
-Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Drawing # For Exif access
 Add-Type -Path "$PSScriptRoot\VISE_MediaInfo\VISE_MediaInfo.dll"
 $MediaInfo = New-Object VISE_MediaInfo.MediaInfo
 
-#$Global:MediaInfo = "$PSScriptRoot\MediaInfo\MediaInfo.exe"
-
 Import-Module PSParallel
 
-$ExtPhoto     = '.jpg','.jpeg','.png'
+$ExtPhoto     = '.jpg','.jpeg','.png','.gif'
 $ExtVideo     = '.3gp','.mp4','.avi','.mov','.mkv'
 $Extensions   = $ExtPhoto + $ExtVideo
 
 $NameFormats  = '(?<Year>\d{4})(?<Month>\d{2})(?<Day>\d{2})_(?<Hour>\d{2})(?<Minute>\d{2})(?<Second>\d{2})',
+                '(?<Year>\d{4})-(?<Month>\d{2})-(?<Day>\d{2})_(?<Hour>\d{2})-(?<Minute>\d{2})-(?<Second>\d{2})',
+                'IMG-(?<Year>\d{4})(?<Month>\d{2})(?<Day>\d{2})-WA(?<Hour>\d{2})(?<Minute>\d{2})',
                 'IMG_(?<Year>\d{4})(?<Month>\d{2})(?<DayOfYear>\d{3})_(?<MinuteOfDay>\d{4})'
 $NameRegex    = $NameFormats -join '|'
 
-$VideoMutex   = New-Object System.Threading.Mutex # Don't allow video parallel processing to save memory and time
+$NameTags     = 'NIGHT|HDR|PANO|COLLAGE|HDR-COLLAGE|EFFECTS|SCREENSHOT|EDITED|-WA\d{4}'
+
+$DiskMutex    = New-Object System.Threading.Mutex # Don't allow video parallel processing to save memory and time
+
+#region Get dates from particular sources
 
 function Get-VideoDate {
     param(
         [Parameter(Mandatory)]
-        $Path
+        $FullName
     )
 
     try {
-        $VideoMutex.WaitOne() | Out-Null
-        if ($MediaInfo.Open($Path)) {
-            $Raw = $MediaInfo.Get([VISE_MediaInfo.StreamKind]::General,0,'Encoded_Date',[VISE_MediaInfo.InfoKind]::Text,[VISE_MediaInfo.InfoKind]::Name)
-            $MediaInfo.Close()
-
-            return [datetime]($Raw.Substring(4) + 'Z')
-        }
+        $DiskMutex.WaitOne() | Out-Null
+        if (!$MediaInfo.Open($FullName)) { return }
+        $Raw = $MediaInfo.Get([VISE_MediaInfo.StreamKind]::General,0,'Encoded_Date',[VISE_MediaInfo.InfoKind]::Text,[VISE_MediaInfo.InfoKind]::Name)
+        $MediaInfo.Close()
     }
     finally {
-        $VideoMutex.ReleaseMutex() | Out-Null
+        $DiskMutex.ReleaseMutex() | Out-Null
+    }
+    
+    if ($Raw) {
+        [datetime]($Raw.Substring(4) + 'Z')
     }
 }
-
-<#function Get-VideoDate {
-    param(
-        [Parameter(Mandatory)]
-        $Path
-    )
-    try {
-        $VideoMutex.WaitOne()
-        (& $Global:MediaInfo $Path | sls 'encoded.+?UTC (.+)').Matches[0].Groups[1].Value.ToDateTime($null)
-    }
-    finally {
-        $VideoMutex.ReleaseMutex()
-    }
-}#>
-
 function Get-ExifDate {
     param(
         [Parameter(Mandatory)]
-        $Path
+        $FullName
     )
 
     $Retries       = 0
     $LastException = $false
     do {
         try {
-            [System.Drawing.Image]$Image = [System.Drawing.Image]::FromFile($Path)
+            $DiskMutex.WaitOne() | Out-Null
+            [System.Drawing.Image]$Image = [System.Drawing.Image]::FromFile($FullName)
         }
         catch [System.OutOfMemoryException] {
             $LastException = $_
             Start-Sleep -Milliseconds 500 # just wait a bit for memory situation to maybe resolve
+        }
+        finally {
+            $DiskMutex.ReleaseMutex() | Out-Null
         }
     } while (!$Image -and $Retries -lt 3)
 
@@ -83,7 +77,6 @@ function Get-ExifDate {
         $Image.Dispose()
     }
 }
-
 function Get-MetaDate {
         param(
         [Parameter(Mandatory)]
@@ -102,8 +95,7 @@ function Get-MetaDate {
         return
     }
 }
-
-function Get-NameDate {
+function Get-NameDate { # add whatsapp date format - without time
     param(
         [Parameter(Mandatory)]
         $Name
@@ -134,6 +126,10 @@ function Get-NameDate {
     }
 }
 
+#endregion
+
+#region Get packaged dates
+
 # TODO: Read Exif geotag for timezone-aware comparison of Exif <> Name dates
 function Get-AllDates {
     param(
@@ -152,9 +148,9 @@ function Get-AllDates {
         $NameDate = Get-NameDate $File.Name
 
         $Dates    = [Ordered]@{
-                        CreationDate     = $File.CreationTime
-                        ModificationDate = $File.LastWriteTime
-                    }
+            CreationDate     = $File.CreationTime
+            ModificationDate = $File.LastWriteTime
+        }
         
         if ($NameDate) { $Dates.Add('NameDate', $NameDate) }
         if ($MetaDate) { $Dates.Add('MetaDate', $MetaDate) }
@@ -207,6 +203,55 @@ function Get-AllDates {
         } + $Dates)
     }
 }
+function Get-BestDate {
+    param(
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [string]
+        $FullName
+    )
+
+    process {
+        $File = Get-Item $FullName
+
+        $NameDate = Get-NameDate $File.Name
+        if ($NameDate) {
+            return [PSCustomObject]@{
+                FullName      = $FullName
+                DirectoryName = $File.DirectoryName
+                Extension     = $File.Extension
+                Date          = $NameDate
+                DateType      = 'NameDate'
+            }
+        }
+
+        $MetaDate = Get-MetaDate $FullName
+        if ($MetaDate) {
+            return [PSCustomObject]@{
+                FullName      = $FullName
+                DirectoryName = $File.DirectoryName
+                Extension     = $File.Extension
+                Date          = $MetaDate
+                DateType      = 'MetaDate'
+            }
+        }
+
+        $Dates = @{
+            CreationDate     = $File.CreationTime
+            ModificationDate = $File.LastWriteTime
+        }
+
+        $Earliest = $Dates.GetEnumerator() | Sort Value | Select -First 1
+        return [PSCustomObject]@{
+            FullName      = $FullName
+            DirectoryName = $File.DirectoryName
+            Extension     = $File.Extension
+            Date          = $Earliest.Value
+            DateType      = $Earliest.Name
+        }
+    }
+}
+
+#endregion
 
 function Rename-Media {
     param(
@@ -217,67 +262,27 @@ function Rename-Media {
 
     process {
         $FilesToRename = Get-ChildItem $FullName -File -Recurse | ? Extension -in $Extensions | ? Name -NotMatch '^20\d{6}_\d{6}(_\w+)?\.' # (_\w)? is for _HDR, _PANO, etc
-        $FilesToRename = $FilesToRename | Get-Random -Count $FilesToRename.Count # Randomization is essential for videos to be evenly mixed with photos (video processing is single-threaded)
-        $FileDates     = $FilesToRename | Invoke-Parallel -ThrottleLimit 64 { Get-AllDates $_.FullName }
+        #$FilesToRename = $FilesToRename | Get-Random -Count 400 # Randomization is essential for videos to be evenly mixed with photos (video processing is single-threaded)
+        #$TimeBefore = get-date
+        $FileDates     = $FilesToRename | Invoke-Parallel -ThrottleLimit 4 { Get-BestDate $_.FullName }
+        #Write-Host ('Time passed: ' + (Get-Date).Subtract($TimeBefore).TotalSeconds)
         foreach ($File in $FileDates)
         {
-            
+            $Tag = ''
+            if ($File.FullName -match $NameTags)
+            {
+                $Tag = '_' + $Matches[0].ToUpper() -replace '-WA\d{4}','WHATSAPP'
+            }
+
+            $NewName       = $File.Date.ToString('yyyyMMdd_HHmmss') + $Tag + $File.Extension
+            $NameIncrement = 1
+            while (Test-Path (Join-Path $File.DirectoryName $NewName)) {
+                $NewName       = $File.Date.ToString('yyyyMMdd_HHmmss') + '_' + $NameIncrement + $Tag + $File.Extension
+                $NameIncrement += 1
+            }
+
+            Rename-Item $File.FullName $NewName
+            if ($?) { Write-Host ('{0,25} -> {1} [{2}]' -f $File.FullName, $NewName, $File.DateType ) }
         } # end foreach
     } # end process
 } #end function
-
-function Rename-Media_Old {
-    param(
-        [Parameter(Mandatory,ValueFromPipeline,ValueFromPipelineByPropertyName)]
-        [string]
-        $FullName
-    )
-
-    process {
-        $FilesToRename = Get-ChildItem $FullName -File -Recurse | ? Extension -in $Extensions | ? Name -NotMatch '^20\d{6}_\d{6}(_\w+)?\.'
-        foreach ($File in $FilesToRename)
-        {
-            if ($File.Name -match $NameRegex)
-            {
-                $Year  = [int]::Parse($Matches.Year)
-                $Month = [int]::Parse($Matches.Month)
-
-                if ($Matches.ContainsKey('DayOfYear'))
-                {
-                    $Date = [datetime]::new($Year,1,1).AddDays([int]::Parse($Matches.DayOfYear) - 1).AddMinutes([int]::Parse($Matches.MinuteOfDay))
-                    if ($Date.Month -ne $Month)
-                    {
-                        Write-Warning "Date not consistent for $($File.Name)"
-                        $CancelRename = $true
-                    }
-                    $Day    = $Date.Day
-                    $Hour   = $Date.Hour
-                    $Minute = $Date.Minute
-                    $Second = 0
-                }
-                else
-                {
-                    $Day    = [int]::Parse($Matches.Day)
-                    $Hour   = [int]::Parse($Matches.Hour)
-                    $Minute = [int]::Parse($Matches.Minute)
-                    $Second = 0
-                    if ($Matches.ContainsKey('Second')) { $Second = [int]::Parse($Matches.Second) }
-                }
-
-                if (!$CancelRename)
-                {
-                    $NewName       = ('{0:0000}{1:00}{2:00}_{3:00}{4:00}{5:00}' -f $Year,$Month,$Day,$Hour,$Minute,$Second) + $File.Extension
-                    $NameIncrement = 1
-                    while (Test-Path (Join-Path $File.DirectoryName $NewName)) {
-                        $NewName       = ('{0:0000}{1:00}{2:00}_{3:00}{4:00}{5:00}_{6}' -f $Year,$Month,$Day,$Hour,$Minute,$Second,$NameIncrement) + $File.Extension
-                        $NameIncrement += 1
-                    }
-
-                    Rename-Item $File.FullName $NewName
-                    if ($?) { Write-Host ('{0,25} -> {1}' -f $File.Name, $NewName ) }
-                }
-            }
-            $CancelRename = $false
-        } # end foreach
-    } # end process
-} # end function

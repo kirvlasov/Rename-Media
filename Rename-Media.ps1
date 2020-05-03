@@ -7,18 +7,18 @@ $MediaInfo = New-Object VISE_MediaInfo.MediaInfo
 Import-Module PSParallel
 
 $ExtPhoto     = '.jpg','.jpeg','.png','.gif'
-$ExtVideo     = '.3gp','.mp4','.avi','.mov','.mkv'
+$ExtVideo     = '.3gp','.mp4','.avi','.mov','.mkv','.webp'
 $Extensions   = $ExtPhoto + $ExtVideo
 
 $NameFormats  = '(?<Year>\d{4})(?<Month>\d{2})(?<Day>\d{2})_(?<Hour>\d{2})(?<Minute>\d{2})(?<Second>\d{2})',
                 '(?<Year>\d{4})-(?<Month>\d{2})-(?<Day>\d{2})_(?<Hour>\d{2})-(?<Minute>\d{2})-(?<Second>\d{2})',
-                'IMG-(?<Year>\d{4})(?<Month>\d{2})(?<Day>\d{2})-WA(?<Hour>\d{2})(?<Minute>\d{2})',
+                '(IMG|VID)-(?<Year>\d{4})(?<Month>\d{2})(?<Day>\d{2})-WA(?<Hour>\d{2})(?<Minute>\d{1})(?<Second>\d{1})',
                 'IMG_(?<Year>\d{4})(?<Month>\d{2})(?<DayOfYear>\d{3})_(?<MinuteOfDay>\d{4})'
 $NameRegex    = $NameFormats -join '|'
 
 $NameTags     = 'NIGHT|HDR|PANO|COLLAGE|HDR-COLLAGE|EFFECTS|SCREENSHOT|EDITED|-WA\d{4}'
 
-$DiskMutex    = New-Object System.Threading.Mutex # Don't allow video parallel processing to save memory and time
+$DiskMutex    = New-Object System.Threading.Mutex # Don't allow parallel processing to save memory and time
 
 #region Get dates from particular sources
 
@@ -130,7 +130,6 @@ function Get-NameDate { # add whatsapp date format - without time
 
 #region Get packaged dates
 
-# TODO: Read Exif geotag for timezone-aware comparison of Exif <> Name dates
 function Get-AllDates {
     param(
         [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
@@ -209,30 +208,37 @@ function Get-BestDate {
         [string]
         $FullName
     )
+    begin {
+        function Format-Result {
+            param ($Date, $DateType)
+
+            return [PSCustomObject]@{
+                FullName      = $FullName
+                DirectoryName = $File.DirectoryName
+                Extension     = $File.Extension
+                Date          = $Date
+                DateType      = $DateType
+            }
+        }
+    }
 
     process {
         $File = Get-Item $FullName
 
+        # First priority is file name as the most precise and fastest. BUT whatsapp media contains only date, so for those we also try to query Meta
         $NameDate = Get-NameDate $File.Name
-        if ($NameDate) {
-            return [PSCustomObject]@{
-                FullName      = $FullName
-                DirectoryName = $File.DirectoryName
-                Extension     = $File.Extension
-                Date          = $NameDate
-                DateType      = 'NameDate'
-            }
+        if ($NameDate -and $File.Name -notmatch '-WA\d{4}') {
+            return ( Format-Result $NameDate 'NameDate' )
         }
 
         $MetaDate = Get-MetaDate $FullName
         if ($MetaDate) {
-            return [PSCustomObject]@{
-                FullName      = $FullName
-                DirectoryName = $File.DirectoryName
-                Extension     = $File.Extension
-                Date          = $MetaDate
-                DateType      = 'MetaDate'
-            }
+            return ( Format-Result $MetaDate 'MetaDate' )
+        }
+        # if whatsapp file contains no meta, we already have NameDate
+        elseif ($File.Name -match '-WA\d{4}')
+        {
+            return ( Format-Result $NameDate 'NameDate' )
         }
 
         $Dates = @{
@@ -241,13 +247,7 @@ function Get-BestDate {
         }
 
         $Earliest = $Dates.GetEnumerator() | Sort Value | Select -First 1
-        return [PSCustomObject]@{
-            FullName      = $FullName
-            DirectoryName = $File.DirectoryName
-            Extension     = $File.Extension
-            Date          = $Earliest.Value
-            DateType      = $Earliest.Name
-        }
+        return ( Format-Result $Earliest.Value $Earliest.Name )
     }
 }
 
@@ -257,15 +257,23 @@ function Rename-Media {
     param(
         [Parameter(Mandatory,ValueFromPipeline,ValueFromPipelineByPropertyName)]
         [string]
-        $FullName
+        $FullName,
+
+        [switch]
+        $NoParallelNoProgress
     )
 
     process {
         $FilesToRename = Get-ChildItem $FullName -File -Recurse | ? Extension -in $Extensions | ? Name -NotMatch '^20\d{6}_\d{6}(_\w+)?\.' # (_\w)? is for _HDR, _PANO, etc
-        #$FilesToRename = $FilesToRename | Get-Random -Count 400 # Randomization is essential for videos to be evenly mixed with photos (video processing is single-threaded)
-        #$TimeBefore = get-date
-        $FileDates     = $FilesToRename | Invoke-Parallel -ThrottleLimit 4 { Get-BestDate $_.FullName }
-        #Write-Host ('Time passed: ' + (Get-Date).Subtract($TimeBefore).TotalSeconds)
+
+        # Collect best dates for each file
+        if (!$NoParallelNoProgress) {
+            $FileDates     = $FilesToRename | Invoke-Parallel -ThrottleLimit 4 { Get-BestDate $_.FullName } # We restrict parallelism with mutex. But mutex+parallel is faster than single-threaded loop.
+        }
+        else {
+            $FileDates     = $FilesToRename | Get-BestDate
+        }
+
         foreach ($File in $FileDates)
         {
             $Tag = ''
